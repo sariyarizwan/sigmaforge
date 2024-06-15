@@ -1,0 +1,276 @@
+"""Hypothesis strategies that generate random Sigma rules and matching-relevant events.
+
+Rules are generated at the *YAML level* (detection dicts with modifier keys and condition
+strings), so the whole front end - modifiers, condition parser, quantifiers, simplifier - is in
+the loop, not just the backends.
+
+The alphabet is chosen to stress escaping: LIKE/GLOB metacharacters (``%``, ``_``, ``[``),
+Sigma wildcards and escapes (``*``, ``?``, ``\\``), SQL quotes, and non-ASCII letters whose case
+folding is backend-defined (``é``/``É``, the Kelvin sign).
+"""
+
+from __future__ import annotations
+
+import ipaddress
+from typing import Any
+
+from hypothesis import strategies as st
+
+from sigmaforge.condition import (
+    CondAnd,
+    CondExpr,
+    CondNot,
+    CondOr,
+    CondQuantifier,
+    CondRef,
+    format_condition,
+)
+
+FIELDS = ["Image", "CommandLine", "User", "EventID", "DestinationIp", "Port"]
+ALPHABET = "abAB01-/_%\\'\"*?[]. éÉKk"
+IDENTIFIERS = ["sel1", "sel2", "filter_a", "_helper"]
+
+texts = st.text(alphabet=ALPHABET, max_size=6)
+# Case-sensitivity bugs only show on values with ASCII letters, so cased items always have one.
+lettered = st.builds(lambda pre, ch, post: pre + ch + post, texts, st.sampled_from("abAB"), texts)
+ints = st.integers(min_value=-5, max_value=70000)
+ips = st.sampled_from(
+    ["10.1.2.3", "10.255.0.1", "192.168.1.7", "192.168.2.7", "8.8.8.8", "::1", "2001:db8::5"]
+)
+NETWORK_LIST = [
+    "10.0.0.0/8",
+    "192.168.1.0/24",
+    "0.0.0.0/0",
+    "::1/128",
+    "2001:db8::/32",
+    "8.8.8.8/32",
+]
+networks = st.sampled_from(NETWORK_LIST)
+# Each pool regex comes with strings that sit on its edges (case, anchors, newlines).
+REGEX_SAMPLES: dict[str, list[str]] = {
+    "^a": ["a", "A", "ba", "a\nb", "b\na"],
+    "b$": ["b", "B", "bc", "ab\n"],
+    "a.b": ["axb", "AXB", "a\nb", "ab"],
+    "[0-9]+": ["1", "x", "a1"],
+    "(?:ab|cd)": ["ab", "AB", "Cd", "ac"],
+    "\\\\": ["\\", "/"],
+    "A": ["A", "a"],
+    "^$": ["", "\n", "a"],
+    "\u00e9": ["\u00e9", "\u00c9"],
+    "x*y?": ["", "Y"],
+    "^[a-z]+$": ["abc", "ABC", "ab\n", "a\nb"],
+    "%_": ["%_", "%x", "%_".upper()],
+}
+regexes = st.sampled_from(list(REGEX_SAMPLES))
+
+# Hand-picked values that tend to sit on semantic edges (case, newlines, metacharacters).
+EDGE_VALUES = [
+    "a",
+    "A",
+    "ab",
+    "AB",
+    "a\nb",
+    "a.b",
+    "axb",
+    "cd",
+    "123",
+    "",
+    "\u00e9",
+    "\u00c9",
+    "%",
+    "_",
+]
+event_values = st.one_of(st.none(), texts, ints, ips, st.sampled_from(EDGE_VALUES))
+events = st.lists(
+    st.dictionaries(st.sampled_from(FIELDS), event_values, max_size=len(FIELDS)), max_size=8
+)
+
+
+def _mined_pairs(obj: Any, field: str | None = None) -> list[tuple[str | None, Any]]:
+    """Every ``(field, scalar)`` in a detection; keyword values carry ``field=None``."""
+    if isinstance(obj, dict):
+        return [
+            pair
+            for key, value in obj.items()
+            if key != "condition"
+            for pair in _mined_pairs(value, str(key).split("|")[0] or None)
+        ]
+    if isinstance(obj, list):
+        return [pair for value in obj for pair in _mined_pairs(value, field)]
+    if isinstance(obj, str | int) and not isinstance(obj, bool):
+        return [(field, obj)]
+    return []
+
+
+MISSING = object()
+
+# "same" is weighted up: a rule only fires when *every* item of a selection matches, so most
+# derived values must hit exactly for the off-by-one variants to matter.
+VARIANTS = ["same", "same", "same", "raw", "upper", "lower", "swap", "pad", "mutate"]
+
+
+@st.composite
+def _near_miss(draw: st.DrawFn, seed: Any) -> Any:
+    """A value derived from a rule value: exact, wildcard-filled, re-cased, mutated or padded."""
+    if isinstance(seed, int):
+        return draw(st.sampled_from([seed, str(seed), seed + 1, f"0{seed}", "text"]))
+    if seed in REGEX_SAMPLES:
+        return draw(st.sampled_from(REGEX_SAMPLES[seed]))
+    if "/" in seed and seed in NETWORK_LIST:
+        net = ipaddress.ip_network(seed)
+        other = "::1" if net.version == 4 else "10.0.0.1"
+        return draw(st.sampled_from([str(net.network_address), str(net[-1]), other, seed]))
+    filled = "".join(
+        draw(texts) if ch == "*" else (draw(st.sampled_from("aZ%")) if ch == "?" else ch)
+        for ch in seed.replace("\\*", "*")
+    )
+    variant = draw(st.sampled_from(VARIANTS))
+    if variant == "raw":
+        filled = seed  # the rule text itself, metacharacters and all
+    elif variant == "upper":
+        filled = filled.upper()
+    elif variant == "lower":
+        filled = filled.lower()
+    elif variant == "swap":
+        filled = filled.swapcase()
+    elif variant == "pad":
+        filled = draw(texts) + filled + draw(texts)
+    elif variant == "mutate" and filled:
+        index = draw(st.integers(0, len(filled) - 1))
+        filled = filled[:index] + draw(st.sampled_from(ALPHABET)) + filled[index + 1 :]
+    return filled
+
+
+def events_for(
+    doc: dict[str, Any], fields: list[str] | None = None
+) -> st.SearchStrategy[list[dict[str, Any]]]:
+    """Events whose values are mostly derived from the rule's own values for the same field."""
+    pairs = _mined_pairs(doc["detection"])
+    keyword_seeds = [v for f, v in pairs if f is None]
+    required: dict[str, st.SearchStrategy[Any]] = {}
+    optional: dict[str, st.SearchStrategy[Any]] = {}
+    for name in fields or FIELDS:
+        seeds = [v for f, v in pairs if f == name] + keyword_seeds
+        if seeds:
+            derived = st.sampled_from(seeds).flatmap(_near_miss)
+            # Fields the rule talks about are usually present; MISSING drops the key.
+            required[name] = st.one_of(derived, derived, derived, event_values, st.just(MISSING))
+        else:
+            optional[name] = event_values
+    event = st.fixed_dictionaries(required, optional=optional).map(
+        lambda e: {k: v for k, v in e.items() if v is not MISSING}
+    )
+    return st.lists(event, min_size=1, max_size=8)
+
+
+@st.composite
+def rule_and_events(draw: st.DrawFn) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    doc = draw(rule_yaml_dict())
+    return doc, draw(events_for(doc))
+
+
+@st.composite
+def detection_item(draw: st.DrawFn) -> tuple[str, Any]:
+    field = draw(st.sampled_from(FIELDS))
+    kind = draw(
+        st.sampled_from(
+            [
+                "plain",
+                "contains",
+                "startswith",
+                "endswith",
+                "contains_all",
+                "cased",
+                "contains_cased",
+                "re",
+                "re_i",
+                "cidr",
+                "cmp",
+                "exists",
+                "null",
+                "int",
+                "windash",
+                "base64offset",
+            ]
+        )
+    )
+    many = st.lists(texts, min_size=1, max_size=3)
+    match kind:
+        case "plain":
+            return field, draw(st.one_of(texts, many))
+        case "contains" | "startswith" | "endswith":
+            return f"{field}|{kind}", draw(st.one_of(texts, many))
+        case "contains_all":
+            return f"{field}|contains|all", draw(many)
+        case "cased":
+            return f"{field}|cased", draw(lettered)
+        case "contains_cased":
+            return f"{field}|contains|cased", draw(st.lists(lettered, min_size=1, max_size=3))
+        case "re":
+            return f"{field}|re", draw(regexes)
+        case "re_i":
+            flag = draw(st.sampled_from(["i", "m", "s", "i|m"]))
+            return f"{field}|re|{flag}", draw(regexes)
+        case "cidr":
+            return f"{field}|cidr", draw(st.one_of(networks, st.lists(networks, min_size=1)))
+        case "cmp":
+            op = draw(st.sampled_from(["gt", "gte", "lt", "lte"]))
+            return f"{field}|{op}", draw(ints)
+        case "exists":
+            return f"{field}|exists", draw(st.booleans())
+        case "null":
+            return field, None
+        case "int":
+            return field, draw(st.one_of(ints, st.lists(ints, min_size=1, max_size=3)))
+        case "windash":
+            return f"{field}|windash|contains", draw(st.sampled_from(["-a", "/b x", "a -k"]))
+        case _:
+            return f"{field}|base64offset|contains", draw(st.sampled_from(["ab", "abc", "é1"]))
+
+
+@st.composite
+def selection(draw: st.DrawFn) -> Any:
+    """A selection: a mapping, a list of mappings, or a keyword list."""
+    form = draw(st.sampled_from(["map", "map", "map", "list_of_maps", "keywords"]))
+
+    def mapping() -> dict[str, Any]:
+        items = draw(st.lists(detection_item(), min_size=1, max_size=2))
+        return dict(items)  # duplicate keys collapse, as YAML would reject them anyway
+
+    if form == "map":
+        return mapping()
+    if form == "list_of_maps":
+        return [mapping() for _ in range(draw(st.integers(1, 3)))]
+    return draw(st.lists(texts.filter(bool), min_size=1, max_size=3))
+
+
+def condition_tree(names: list[str]) -> st.SearchStrategy[CondExpr]:
+    base = st.one_of(
+        st.sampled_from(names).map(CondRef),
+        st.sampled_from(["one", "all"]).map(lambda q: CondQuantifier(q, None)),  # type: ignore[arg-type]
+        st.sampled_from(["one", "all"]).map(lambda q: CondQuantifier(q, "sel*")),  # type: ignore[arg-type]
+    )
+    return st.recursive(
+        base,
+        lambda inner: st.one_of(
+            st.builds(CondAnd, inner, inner),
+            st.builds(CondOr, inner, inner),
+            st.builds(CondNot, inner),
+        ),
+        max_leaves=6,
+    )
+
+
+@st.composite
+def rule_yaml_dict(draw: st.DrawFn) -> dict[str, Any]:
+    count = draw(st.integers(min_value=1, max_value=len(IDENTIFIERS)))
+    names = IDENTIFIERS[:count]
+    if "sel1" not in names:
+        names = ["sel1", *names]
+    detection: dict[str, Any] = {name: draw(selection()) for name in names}
+    detection["condition"] = format_condition(draw(condition_tree(names)))
+    return {
+        "title": "generated",
+        "logsource": {"product": "test"},
+        "detection": detection,
+    }
